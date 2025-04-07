@@ -40,6 +40,13 @@ What's new in Django 6.0
 Minor features
 --------------
 
+:mod:`django.shortcuts`
+~~~~~~~~~~~~~~~~~~~~~~~
+
+* The new :func:`django.shortcuts.make_toast` function returns ``'toast'``.
+
+
+
 :mod:`django.contrib.admin`
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -425,3 +432,6 @@ to remove usage of these features.
 
 * The ``OS_OPEN_FLAGS`` attribute of
   :class:`~django.core.files.storage.FileSystemStorage` is removed.
+
+
+
