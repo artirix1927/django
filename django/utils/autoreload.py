@@ -293,6 +293,61 @@ class BaseReloader:
         self.extra_files = set()
         self.directory_globs = defaultdict(set)
         self._stop_condition = threading.Event()
+        self._delayed_files_logged = set()
+
+    DEBUGGER_SIGNATURES = [
+        # pdb/ipdb: Common interactive method
+        ("pdb.py", "interaction"),
+        ("ipdb/__main__.py", "interaction"),  # ipdb is a wrapper around pdb
+        # Add more as needed, e.g.:
+        # ('pydevd.py', 'run'),  # For pydev (Eclipse/PyCharm)
+        # ('debugpy/_vendored/pydevd/pydevd.py', 'run'),  # For VS Code/debugpy
+        # ('pudb/__init__.py', 'run'),  # For pudb
+    ]
+
+    def log_delay_once(self, path):
+        """
+        Log that we're delaying reload due to debugger, but only once per file
+        until the debugger becomes inactive.
+        """
+        path = Path(path)
+        if path not in self._delayed_files_logged:
+            logger.info(
+                "Debugger active; delaying reload for changed file %s "
+                "(will reload automatically when you continue)",
+                path,
+            )
+            self._delayed_files_logged.add(path)
+
+    def reset_delay_logs_if_debugger_inactive(self):
+        """Clear logged delay tracking if no debugger is active anymore."""
+        if not self.is_debugger_active():
+            if self._delayed_files_logged:
+                logger.debug("Debugger no longer active; clearing delay log tracking.")
+                self._delayed_files_logged.clear()
+
+    def is_debugger_active(self):
+        """Check if any thread is in an active debug session."""
+        import os
+        import sys
+
+        frames = sys._current_frames()
+        for thread_id, frame in frames.items():
+            current_frame = frame
+            while current_frame:
+                filename = os.path.normpath(current_frame.f_code.co_filename)
+                code_name = current_frame.f_code.co_name
+                for dbg_file_substr, dbg_code_substr in self.DEBUGGER_SIGNATURES:
+                    if dbg_file_substr in filename and dbg_code_substr in code_name:
+                        logger.debug(
+                            "Debugger active in thread %s " "(file: %s, func: %s)",
+                            thread_id,
+                            filename,
+                            code_name,
+                        )
+                        return True
+                current_frame = current_frame.f_back
+        return False
 
     def watch_dir(self, path, glob):
         path = Path(path)
@@ -399,20 +454,33 @@ class StatReloader(BaseReloader):
     def tick(self):
         mtimes = {}
         while True:
+            changed_during_debug = False
+
             for filepath, mtime in self.snapshot_files():
                 old_time = mtimes.get(filepath)
-                mtimes[filepath] = mtime
                 if old_time is None:
                     logger.debug("File %s first seen with mtime %s", filepath, mtime)
+                    mtimes[filepath] = mtime
                     continue
-                elif mtime > old_time:
-                    logger.debug(
-                        "File %s previous mtime: %s, current mtime: %s",
-                        filepath,
-                        old_time,
-                        mtime,
-                    )
-                    self.notify_file_changed(filepath)
+                if mtime > old_time:
+                    if self.is_debugger_active():
+                        self.log_delay_once(filepath)  # ← ADD THIS LINE
+                        # Do NOT update mtime — will re-detect next poll
+                        changed_during_debug = True
+                        continue  # skip to next file
+                    else:
+                        logger.debug(
+                            "File %s previous mtime: %s, current mtime: %s",
+                            filepath,
+                            old_time,
+                            mtime,
+                        )
+                        self.notify_file_changed(filepath)
+                        mtimes[filepath] = mtime
+
+            # Reset log tracking if debugger ended during this tick
+            if not changed_during_debug:
+                self.reset_delay_logs_if_debugger_inactive()
 
             time.sleep(self.SLEEP_TIME)
             yield
@@ -445,6 +513,7 @@ class WatchmanReloader(BaseReloader):
         self.roots = defaultdict(set)
         self.processed_request = threading.Event()
         self.client_timeout = int(os.environ.get("DJANGO_WATCHMAN_TIMEOUT", 5))
+        self.pending_changes = set()
         super().__init__()
 
     @cached_property
@@ -580,24 +649,44 @@ class WatchmanReloader(BaseReloader):
             if self.check_server_status(ex):
                 raise
 
+    # def _check_subscription(self, sub):
+    #     subscription = self.client.getSubscription(sub)
+    #     if not subscription:
+    #         return
+    #     logger.debug("Watchman subscription %s has results.", sub)
+    #     for result in subscription:
+    #         # When using watch-project, it's not simple to get the relative
+    #         # directory without storing some specific state. Store the full
+    #         # path to the directory in the subscription name, prefixed by its
+    #         # type (glob, files).
+    #         root_directory = Path(result["subscription"].split(":", 1)[1])
+    #         logger.debug("Found root directory %s", root_directory)
+    #         for file in result.get("files", []):
+    #             self.notify_file_changed(root_directory / file)
+
+    def request_processed(self, **kwargs):
+        logger.debug("Request processed. Setting update_watches event.")
+        self.processed_request.set()
+
     def _check_subscription(self, sub):
         subscription = self.client.getSubscription(sub)
         if not subscription:
             return
         logger.debug("Watchman subscription %s has results.", sub)
         for result in subscription:
-            # When using watch-project, it's not simple to get the relative
-            # directory without storing some specific state. Store the full
-            # path to the directory in the subscription name, prefixed by its
-            # type (glob, files).
             root_directory = Path(result["subscription"].split(":", 1)[1])
             logger.debug("Found root directory %s", root_directory)
             for file in result.get("files", []):
-                self.notify_file_changed(root_directory / file)
+                path = root_directory / file
+                if self.is_debugger_active():
+                    self.log_delay_once(path)  # ← only logs once
+                    self.pending_changes.add(path)
+                else:
+                    self.notify_file_changed(path)
 
-    def request_processed(self, **kwargs):
-        logger.debug("Request processed. Setting update_watches event.")
-        self.processed_request.set()
+        # Also reset logs if debugger became inactive
+        if not self.is_debugger_active():
+            self.reset_delay_logs_if_debugger_inactive()
 
     def tick(self):
         request_finished.connect(self.request_processed)
@@ -616,8 +705,18 @@ class WatchmanReloader(BaseReloader):
             else:
                 for sub in list(self.client.subs.keys()):
                     self._check_subscription(sub)
+
+            # Process any queued changes if debugger is now inactive
+            if self.pending_changes and not self.is_debugger_active():
+                first_path = next(iter(self.pending_changes))
+                logger.info(
+                    "Debugger finished; reloading due to ", "change in %s", first_path
+                )
+                self.notify_file_changed(first_path)
+                self.pending_changes.clear()
+                # Reset logs here — will be cleared on next inactive check
+
             yield
-            # Protect against busy loops.
             time.sleep(0.1)
 
     def stop(self):
